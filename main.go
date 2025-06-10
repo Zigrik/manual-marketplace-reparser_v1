@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"os"
@@ -12,16 +13,17 @@ import (
 )
 
 type Product struct {
-	Name       string
-	Code       string
-	Stock      string
-	PriceShina string
-	PriceMin   string
-	SourceFile string
-	Link       string
+	Data       map[string]string // Хранит все данные для каждой колонки
+	SourceFile string            // Название файла-источника
 }
 
 func main() {
+	// Читаем список дополнительных колонок из файла column.txt
+	additionalColumns, err := readColumnsFromFile("column.txt")
+	if err != nil {
+		log.Fatalf("Ошибка чтения файла column.txt: %v", err)
+	}
+
 	// Создаем выходной файл
 	outputFile := excelize.NewFile()
 	outputSheet := "Объединенные данные"
@@ -29,8 +31,11 @@ func main() {
 	outputFile.SetActiveSheet(index)
 	outputFile.DeleteSheet("Sheet1")
 
-	// Заголовки
-	headers := []string{"Номенклатура", "Код", "Остаток", "цена Шинорама", "цена минимум", "Источник", "ссылка"}
+	// Базовые обязательные колонки + дополнительные из файла + источник
+	headers := append([]string{"Наименование", "Код"}, additionalColumns...)
+	headers = append(headers, "Источник")
+
+	// Записываем заголовки
 	for col, header := range headers {
 		cell, _ := excelize.CoordinatesToCellName(col+1, 1)
 		outputFile.SetCellValue(outputSheet, cell, header)
@@ -38,10 +43,10 @@ func main() {
 
 	var products []Product
 	filesProcessed := 0
-	foundTDSheet := false
+	foundValidFiles := false
 
 	// Чтение файлов
-	err := filepath.Walk("files", func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk("files", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Ошибка доступа к пути %s: %v", path, err)
 			return nil
@@ -58,105 +63,83 @@ func main() {
 		}
 		defer f.Close()
 
-		// Проверяем наличие листа TDSheet
-		sheetExists := false
-		for _, sheet := range f.GetSheetList() {
-			if sheet == "TDSheet" {
-				sheetExists = true
-				break
-			}
-		}
-
-		if !sheetExists {
-			log.Printf("Файл %s не содержит листа TDSheet", path)
+		// Получаем список всех листов в файле
+		sheets := f.GetSheetList()
+		if len(sheets) == 0 {
+			log.Printf("Файл %s не содержит ни одного листа", path)
 			return nil
 		}
 
-		foundTDSheet = true
-		rows, err := f.GetRows("TDSheet")
+		// Будем обрабатывать первый лист (можно изменить на цикл по всем листам)
+		sheetName := sheets[0]
+		rows, err := f.GetRows(sheetName)
 		if err != nil {
-			log.Printf("Ошибка чтения листа TDSheet из %s: %v", path, err)
+			log.Printf("Ошибка чтения листа %s из %s: %v", sheetName, path, err)
 			return nil
 		}
 
 		if len(rows) <= 1 {
-			log.Printf("Лист TDSheet в файле %s пуст или содержит только заголовки", path)
+			log.Printf("Лист %s в файле %s пуст или содержит только заголовки", sheetName, path)
 			return nil
-		}
-
-		// Более гибкая проверка заголовков
-		expectedHeaders := map[string]bool{
-			"номенклатура": false,
-			"код":          false,
-			"остаток":      false,
-			"шинорама":     false,
-			"минимум":      false,
-			"ссылка":       false,
-		}
-
-		// Проверяем заголовки (первая строка)
-		for _, h := range rows[0] {
-			hLower := strings.ToLower(h)
-			for expected := range expectedHeaders {
-				if strings.Contains(hLower, expected) {
-					expectedHeaders[expected] = true
-				}
-			}
-		}
-
-		// Проверяем что все нужные заголовки найдены
-		for expected, found := range expectedHeaders {
-			if !found {
-				log.Printf("В файле %s не найден заголовок содержащий '%s'", path, expected)
-				return nil
-			}
 		}
 
 		// Определяем индексы столбцов
 		colIndexes := make(map[string]int)
 		for i, h := range rows[0] {
-			hLower := strings.ToLower(h)
+			hLower := strings.ToLower(strings.TrimSpace(h))
 			switch {
-			case strings.Contains(hLower, "номенклатура"):
-				colIndexes["name"] = i
+			case strings.Contains(hLower, "наименование"):
+				colIndexes["Наименование"] = i
 			case strings.Contains(hLower, "код"):
-				colIndexes["code"] = i
-			case strings.Contains(hLower, "остаток"):
-				colIndexes["stock"] = i
-			case strings.Contains(hLower, "шинорама"):
-				colIndexes["price_shina"] = i
-			case strings.Contains(hLower, "минимум"):
-				colIndexes["price_min"] = i
-			case strings.Contains(hLower, "ссылка"):
-				colIndexes["link"] = i
+				colIndexes["Код"] = i
+			default:
+				// Проверяем дополнительные колонки
+				for _, col := range additionalColumns {
+					if strings.Contains(hLower, strings.ToLower(col)) {
+						colIndexes[col] = i
+						break
+					}
+				}
 			}
 		}
 
+		// Проверяем наличие обязательных колонок
+		if _, ok := colIndexes["Наименование"]; !ok {
+			log.Printf("В файле %s не найден столбец 'Наименование'", path)
+			return nil
+		}
+		if _, ok := colIndexes["Код"]; !ok {
+			log.Printf("В файле %s не найден столбец 'Код'", path)
+			return nil
+		}
+
+		foundValidFiles = true
+
 		// Обрабатываем строки данных
-		for rowIdx, row := range rows[1:] {
-			// Проверяем что строка содержит достаточно данных
-			requiredCols := []string{"name", "code", "stock", "price_shina", "price_min", "link"}
-			valid := true
-			for _, col := range requiredCols {
-				if colIndexes[col] >= len(row) {
-					log.Printf("Пропуск строки %d в файле %s: недостаточно столбцов", rowIdx+2, path)
-					valid = false
-					break
-				}
-			}
-			if !valid {
-				continue
+		for _, row := range rows[1:] {
+			product := Product{
+				Data:       make(map[string]string),
+				SourceFile: filepath.Base(path),
 			}
 
-			products = append(products, Product{
-				Name:       strings.TrimSpace(row[colIndexes["name"]]),
-				Code:       strings.TrimSpace(row[colIndexes["code"]]),
-				Stock:      strings.TrimSpace(row[colIndexes["stock"]]),
-				PriceShina: strings.TrimSpace(row[colIndexes["price_shina"]]),
-				PriceMin:   strings.TrimSpace(row[colIndexes["price_min"]]),
-				Link:       strings.TrimSpace(row[colIndexes["link"]]),
-				SourceFile: filepath.Base(path),
-			})
+			// Заполняем обязательные поля
+			if colIndexes["Наименование"] < len(row) {
+				product.Data["Наименование"] = strings.TrimSpace(row[colIndexes["Наименование"]])
+			}
+			if colIndexes["Код"] < len(row) {
+				product.Data["Код"] = strings.TrimSpace(row[colIndexes["Код"]])
+			}
+
+			// Заполняем дополнительные поля
+			for _, col := range additionalColumns {
+				if colIdx, ok := colIndexes[col]; ok && colIdx < len(row) {
+					product.Data[col] = strings.TrimSpace(row[colIdx])
+				} else {
+					product.Data[col] = "" // Пустая строка, если колонка не найдена
+				}
+			}
+
+			products = append(products, product)
 		}
 
 		filesProcessed++
@@ -168,36 +151,29 @@ func main() {
 		log.Fatal("Ошибка при обходе папки:", err)
 	}
 
-	if !foundTDSheet {
-		log.Fatal("Ни один файл не содержит листа с именем TDSheet")
-	}
-
-	if filesProcessed == 0 {
-		log.Fatal("Не найдено ни одного подходящего файла в папке 'files'")
+	if !foundValidFiles {
+		log.Fatal("Не найдено ни одного файла с обязательными колонками 'Наименование' и 'Код'")
 	}
 
 	if len(products) == 0 {
 		log.Fatal("Не найдено ни одной строки данных во всех файлах")
 	}
 
-	// Сортировка
+	// Сортировка по наименованию
 	sort.Slice(products, func(i, j int) bool {
-		return strings.ToLower(products[i].Name) < strings.ToLower(products[j].Name)
+		return strings.ToLower(products[i].Data["Наименование"]) < strings.ToLower(products[j].Data["Наименование"])
 	})
 
 	// Запись данных
 	for rowIdx, product := range products {
-		data := []string{
-			product.Name,
-			product.Code,
-			product.Stock,
-			product.PriceShina,
-			product.PriceMin,
-			product.Link,
-			product.SourceFile,
-		}
+		for colIdx, header := range headers {
+			value := ""
+			if header == "Источник" {
+				value = product.SourceFile
+			} else {
+				value = product.Data[header]
+			}
 
-		for colIdx, value := range data {
 			cell, _ := excelize.CoordinatesToCellName(colIdx+1, rowIdx+2)
 			if err := outputFile.SetCellValue(outputSheet, cell, value); err != nil {
 				log.Printf("Ошибка записи в ячейку %s: %v", cell, err)
@@ -205,16 +181,53 @@ func main() {
 		}
 	}
 
-	// Автоширина столбцов
+	// Устанавливаем ширину колонок
 	for col := 1; col <= len(headers); col++ {
 		colName, _ := excelize.ColumnNumberToName(col)
-		outputFile.SetColWidth(outputSheet, colName, colName, 20)
+		width := 10
+		header := headers[col-1]
+		if header == "Наименование" || header == "Источник" || header == "комментарий" {
+			width = 40
+		}
+		outputFile.SetColWidth(outputSheet, colName, colName, float64(width))
 	}
 
+	// Сохраняем файл
 	if err := outputFile.SaveAs("объединенные_данные.xlsx"); err != nil {
 		log.Fatal("Ошибка сохранения файла:", err)
 	}
 
-	fmt.Printf("Готово! Обработано %d файлов, %d строк данных\n", filesProcessed, len(products))
+	fmt.Printf("\nГотово! Обработано %d файлов, %d строк данных\n", filesProcessed, len(products))
 	fmt.Println("Результат сохранен в 'объединенные_данные.xlsx'")
+	fmt.Println("\nНажмите любую клавишу для выхода...")
+	waitForAnyKey()
+}
+
+// Функция для чтения списка колонок из файла
+func readColumnsFromFile(filename string) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var columns []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			columns = append(columns, line)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return columns, nil
+}
+
+// Функция для ожидания нажатия любой клавиши
+func waitForAnyKey() {
+	bufio.NewReader(os.Stdin).ReadByte()
 }
